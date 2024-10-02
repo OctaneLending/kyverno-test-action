@@ -1,0 +1,88 @@
+# DO NOT MODIFY THIS FILE
+
+# This workflow is required for all PRs to OctaneLending repositories
+# that want to merge code into the main/master branch. Full Time Employees
+# (FTE) must approve the PR before it can be merged.
+name: Check FTE Approval
+
+on:
+  pull_request_review:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+
+jobs:
+  check-approval:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.base.ref == 'master' || github.event.pull_request.base.ref == 'main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Obtain Terraform Access Token
+        uses: OctaneLending/action-obtain-github-app-access-token@v3
+        with:
+          gh_app_auth_configs: ${{ secrets.TERRAFORM_CREDENTIALS_TOKEN }} # This token is required to read organizational groups
+
+      - name: Check PR Author FTE Status
+        id: check-author-fte
+        run: |
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          FTE_TEAM="full-time-employees"
+          FTE_STATUS=$(curl -s -H "Authorization: Bearer ${{ env.ACCESS_TOKEN }}" \
+            https://api.github.com/orgs/OctaneLending/teams/$FTE_TEAM/memberships/$PR_AUTHOR | jq -r '.state')
+          echo The Author of the PR FTE Status Is: $FTE_STATUS
+          echo "FTE_STATUS=$FTE_STATUS" >> $GITHUB_OUTPUT
+
+      - name: Get PR Reviewers
+        if: steps.check-author-fte.outputs.FTE_STATUS != 'active'
+        id: reviewers
+        uses: octokit/request-action@v2.3.1
+        with:
+          route: GET /repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews
+        env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for FTE Approvers
+        if: steps.check-author-fte.outputs.FTE_STATUS != 'active'
+        id: check-fte
+        run: |
+          FTE_TEAM="full-time-employees"
+          FTE_FOUND=false
+
+          # Get the list of all reviewers
+          reviewers=$(echo '${{ steps.reviewers.outputs.data }}' | jq -r '
+            # Create a list of objects with necessary fields
+            [ .[] | select(.user.login != null and .state != "COMMENTED") | {login: .user.login, date: .submitted_at, state: .state} ]
+            # Group this list by login
+            | group_by(.login)
+            # For each group, select the most recent review based on the date
+            | map(max_by(.date))
+            # Filter to include only reviews where state is one of the specified types
+            | map(select(.state == "APPROVED"))
+            # Extract the login of the reviewer
+            | .[].login
+          ')
+
+          for reviewer in $reviewers; do
+            echo 'Checking Group Membership For:' $reviewer
+            # Check if the reviewer is in the FTE team
+            IS_FTE=$(curl -s -H 'Authorization: Bearer ${{ env.ACCESS_TOKEN }}' \
+              https://api.github.com/orgs/OctaneLending/teams/$FTE_TEAM/memberships/$reviewer | jq -r '.state')
+            echo 'Result:' $IS_FTE
+            if [[ "$IS_FTE" == "active" ]]; then
+              FTE_FOUND=true
+              echo $reviewer ' is in the FTE group!'
+              break
+            fi
+          done
+
+          if [[ "$FTE_FOUND" == "true" ]]; then
+            echo "At least one FTE approved. Proceeding..."
+          else
+            echo 'No reviewers found on PR from FTE group...'
+            echo "::error::No FTE approvals found on Pull Request. Failing the job... We require at least 1 FTE review on PRs. If you are an FTE you need to be added to the FTE group, please reach out to the Avengers."
+            exit 1
+          fi
